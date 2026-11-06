@@ -1,5 +1,0 @@
-rapidocr_onnxruntime
-faster-whisper
-huggingface_hub
-av
-numpy
