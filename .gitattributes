@@ -1,0 +1,19 @@
+# 文本统一用 LF 存储，检出时按平台转换
+* text=auto
+
+# Windows 专用脚本保持 CRLF
+*.ps1 text eol=crlf
+*.vbs text eol=crlf
+# 初版的 .bat 是 GBK 编码（中文 Windows 的 cmd 要求）：仓库里按 UTF-8 存，检出时转回 GBK
+*.bat text eol=crlf working-tree-encoding=GBK
+
+# 二进制
+*.ico binary
+*.png binary
+*.jpg binary
+*.bin binary
+*.onnx binary
+*.dll binary
+*.exe binary
+*.pyc binary
+*.zip binary
