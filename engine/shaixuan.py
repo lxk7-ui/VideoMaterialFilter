@@ -9,6 +9,7 @@
 识别进程把进度一行一行写到标准输出，每行是「类型<Tab>内容」：
     LOG 文字 / QUEUE {"todo":n} / FILE 相对路径 / PROG {"stage":"画面","pct":37}
     RESULT {...} / DONE 相对路径 / IDLE / FAIL 原因
+RESULT 里带 "memo": true 的，是按「筛选记忆」处理的（之前查过，这次没有真的查）。
 """
 import os
 import sys
@@ -27,6 +28,7 @@ import csv
 import json
 import time
 import queue
+import hashlib
 import shutil
 import threading
 import traceback
@@ -41,6 +43,7 @@ HOME_DIR = os.environ.get('SUCAI_HOME') or APP_DIR
 DATA_DIR = os.environ.get('SUCAI_DATA') or APP_DIR
 CONFIG_PATH = os.path.join(DATA_DIR, '设置.ini')
 LOG_PATH = os.path.join(DATA_DIR, '运行日志.txt')
+MEMORY_PATH = os.path.join(DATA_DIR, '筛选记忆.txt')
 MODEL_DIR = os.path.join(HOME_DIR, 'models')
 VIDEO_EXT = ('.mp4', '.mov', '.webm', '.m4v', '.mkv', '.flv')
 REJECT_DIR = '已筛掉'
@@ -67,7 +70,7 @@ DEFAULT_INI = """; 素材筛选器设置。一般在软件里点「筛选规则�
 
 [语音]
 ; 语音识别模型：tiny / base / small / medium。越大越准，也越慢
-; 软件里已经带了 small；换成别的，第一次用会联网下载
+; 软件里已经带了 small；换成别的，先在软件里点「模型下载」下载好
 模型 = small
 ; 语音里说到上面的抖音关键词也筛掉：是 / 否
 也查抖音关键词 = 否
@@ -256,7 +259,7 @@ def ensure_model(size, log):
         except Exception as e:
             last = e
             log('　　这个地址下载失败：%s' % str(e)[:150])
-    raise RuntimeError('语音模型 %s 下载不下来。检查网络，或者在「筛选规则」里把模型改回 small（%s）'
+    raise RuntimeError('语音模型 %s 下载不下来。点软件里的「模型下载」下载，或者在「筛选规则」里把模型改回 small（%s）'
                        % (size, str(last)[:200]))
 
 
@@ -510,8 +513,9 @@ def is_stable(path):
 
 
 def load_done(folder):
-    """记录里有的视频都算查过了；最后一条是「重查」（在软件里点了重新检查）的除外"""
-    done = set()
+    """记录里有的视频都算查过了；最后一条是「重查」（在软件里点了重新检查）的除外。
+    返回 {相对路径: (结果, 检查时间)}，都是这个视频最近的一条"""
+    done = {}
     p = os.path.join(folder, REPORT_NAME)
     if not os.path.exists(p):
         return done
@@ -520,9 +524,9 @@ def load_done(folder):
             for row in csv.DictReader(f):
                 res, rel = row.get('结果'), row.get('文件', '')
                 if res in ('保留', '筛掉', '出错', '放回'):
-                    done.add(rel)
+                    done[rel] = (res, row.get('检查时间') or '')
                 elif res == '重查':
-                    done.discard(rel)
+                    done.pop(rel, None)
     except Exception:
         pass
     return done
@@ -558,6 +562,144 @@ def move_to_reject(folder, rel):
     return dst
 
 
+# ---------------------------------------------------------------- 筛选记忆
+# 查过的视频按「指纹」记在软件根目录的 筛选记忆.txt 里。视频挪到别的文件夹、改了名字，指纹都不变，
+# 所以换个地方也认得出来。窗口程序（Memory.cs）读写同一个文件、算同一种指纹，改的时候两边一起改。
+FP_CHUNK = 64 * 1024
+MEMORY_FIELDS = ('time', 'result', 'fp', 'name', 'folder', 'checks', 'reason')
+MEMORY_HEAD = ('# 素材筛选器的筛选记忆：查过的视频按内容记在这里，挪了文件夹、改了名字也认得出来，不会重复查。\r\n'
+               '# 每行：时间、结果、指纹、文件名、所在文件夹、查了什么、原因。不要手动改；要清空，在「筛选规则」里点「清空」。\r\n')
+CLEARED_MARK = '# 清空时间：'
+
+
+def fingerprint(path):
+    """视频的指纹：文件大小 + 开头和结尾各 64KB 内容的 SHA-1。
+    挪到别的文件夹、改名字都不变；剪过、重新导出过就变了"""
+    size = os.path.getsize(path)
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        if size <= 2 * FP_CHUNK:
+            h.update(f.read())
+        else:
+            h.update(f.read(FP_CHUNK))
+            f.seek(size - FP_CHUNK)
+            h.update(f.read(FP_CHUNK))
+    return '%d-%s' % (size, h.hexdigest())
+
+
+def fingerprint_or_none(path):
+    try:
+        return fingerprint(path)
+    except OSError:
+        return None
+
+
+def settled(path):
+    """看着已经下载完了：不是空文件，最近 5 秒没变过。和 is_stable 不同，这里不等"""
+    try:
+        st = os.stat(path)
+        return st.st_size > 0 and time.time() - st.st_mtime > 5
+    except OSError:
+        return False
+
+
+class Memory:
+    """筛选记忆。文件只往后追加，同一个指纹以最后一行为准；最后一行是「忘记」（点过重新检查）的就当没记过"""
+
+    def __init__(self, path=MEMORY_PATH):
+        self.path = path
+        self.by_fp = {}
+        self.by_path = {}   # 完整路径（小写）-> 指纹，补记旧记录时少读几次文件
+        self.cleared = ''   # 上次清空的时间：比这早的筛选记录不往回补
+        self.broken = False
+        try:
+            with open(path, encoding='utf-8-sig', errors='replace') as f:
+                for line in f:
+                    line = line.rstrip('\r\n')
+                    if line.startswith(CLEARED_MARK):
+                        self.cleared = line[len(CLEARED_MARK):].strip()
+                    elif line and not line.startswith('#'):
+                        self._fold(line.split('\t'))
+        except FileNotFoundError:
+            pass
+        except OSError:
+            self.broken = True
+
+    def _fold(self, parts):
+        if len(parts) < 3 or not parts[2]:
+            return
+        e = dict(zip(MEMORY_FIELDS, parts + [''] * (len(MEMORY_FIELDS) - len(parts))))
+        if e['result'] == '忘记':
+            self.by_fp.pop(e['fp'], None)
+        else:
+            self.by_fp[e['fp']] = e
+        if e['name']:
+            self.by_path[os.path.join(e['folder'], e['name']).lower()] = e['fp']
+
+    def get(self, fp):
+        return self.by_fp.get(fp)
+
+    def knows_path(self, path, size):
+        """这个位置上、这么大的文件已经记过了"""
+        fp = self.by_path.get(path.lower(), '')
+        return fp.startswith('%d-' % size) and fp in self.by_fp
+
+    def add(self, fp, result, path, checks='', reason='', when=None):
+        e = {'time': when or datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'result': result, 'fp': fp,
+             'name': os.path.basename(path), 'folder': os.path.dirname(path), 'checks': checks,
+             'reason': re.sub(r'[\t\r\n]+', ' ', reason or '')}
+        parts = [e[k] for k in MEMORY_FIELDS]
+        self._fold(parts)
+        if self.broken:
+            return False
+        try:
+            new = not os.path.exists(self.path)
+            with open(self.path, 'a', encoding='utf-8', newline='') as f:
+                if new:
+                    f.write(MEMORY_HEAD)
+                f.write('\t'.join(parts) + '\r\n')
+            return True
+        except OSError:
+            return False
+
+
+def memory_action(entry, opts):
+    """之前查过的视频又出现了（entry 是筛选记忆里它最近的一条），这次怎么处理。返回：
+        'skip'    不查，算通过（筛选记录里写「保留 · 之前查过」）
+        'reject'  不查，直接挪进「已筛掉」，原因沿用上次的
+        'check'   照常重新查一遍
+    entry['result']  上次的结果：保留 / 筛掉 / 放回（放回 = 筛错了、手动放回来的）
+    entry['time']    上次查的时间，比如 '2026-11-07 21:30:05'
+    entry['checks']  上次查了什么：'画面+语音' / '画面' / '语音'；空的是旧版本留下的记录，不知道查了什么
+    entry['reason']  上次筛掉的原因，比如 '画面有抖音号、语音说了价格'
+    opts['frame'] / opts['audio']  这次勾没勾「画面」「语音」
+    窗口里「待检查」的个数是按「保留、放回 → skip，其他 → check」算的（Memory.cs 的 Skips），
+    这里改了规则，那边也要跟着改，不然个数会对不上。"""
+    # TODO(human): 按你的用法决定之前查过的视频怎么处理（现在：通过的不再查，筛掉过的重新查）
+    if entry['result'] in ('保留', '放回'):
+        return 'skip'
+    return 'check'
+
+
+def backfill(folder, records, memory):
+    """筛选记录里保留了、筛选记忆里还没有的视频（比如旧版本查过的）补记进去，以后挪走了也认得出来。
+    点过「清空」的话，清空以前的记录不补。返回补了几个"""
+    added = 0
+    for rel, (res, when) in records.items():
+        if res not in ('保留', '放回') or (memory.cleared and when <= memory.cleared):
+            continue
+        path = os.path.join(folder, rel)
+        try:
+            if memory.knows_path(path, os.path.getsize(path)):
+                continue
+            fp = fingerprint(path)
+        except OSError:
+            continue  # 视频已经不在这儿了
+        if memory.get(fp) is None and memory.add(fp, res, path, when=when or None):
+            added += 1
+    return added
+
+
 def run_folder(folder, opts, engines, stop, log, emit_ev):
     """opts: frame/audio/watch/recursive；engines: dict 放 ocr/asr（懒加载，重复使用）"""
     cfg = Config()
@@ -572,15 +714,76 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
     asr = engines.get('asr') if opts['audio'] else None
     emit_ev('READY', '')
 
-    done = load_done(folder)
+    records = load_done(folder)
+    done = set(records)
+    memory = Memory()
+    if memory.broken:
+        log('「筛选记忆.txt」读不了，这次先不用筛选记忆。')
+    else:
+        n = backfill(folder, records, memory)
+        if n:
+            log('筛选记录里以前查过的 %d 个视频，补记进了筛选记忆。' % n)
+    checks = '+'.join(name for name, on in (('画面', opts['frame']), ('语音', opts['audio'])) if on)
     pending_rows = []
-    kept = rejected = 0
+    kept = rejected = remembered = 0
     tries = {}
     announced_wait = False
     last_todo = -1
 
+    def from_memory(rel, fp):
+        """筛选记忆里有这个视频，就按 memory_action 处理。返回 True 表示处理完了，不用再查"""
+        nonlocal rejected, remembered
+        entry = memory.get(fp)
+        if entry is None:
+            return False
+        action = memory_action(entry, opts)
+        if action not in ('skip', 'reject'):
+            return False
+        path = os.path.join(folder, rel)
+        now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        result = {'rel': rel, 'time': now, 'items': [], 'moved': '', 'memo': True}
+        if action == 'skip':
+            remembered += 1
+            why = '之前查过'
+            pending_rows.append([now, rel, '保留', why, '', ''])
+            # 记下它现在的位置（结果、时间还是上次的），下次补记时不用再读文件
+            memory.add(fp, entry['result'], path, entry['checks'], entry['reason'], entry['time'])
+            result['result'] = '保留'
+        else:
+            why = '之前筛掉过' + ('：' + entry['reason'] if entry['reason'] else '')
+            try:
+                result['moved'] = move_to_reject(folder, rel)
+                rejected += 1
+                log('筛掉（%s）：%s' % (why, rel))
+                pending_rows.append([now, rel, '筛掉', why, '', ''])
+                result['result'] = '筛掉'
+            except OSError as e:
+                log('%s 要筛掉（%s），但挪不动（是不是正在播放？），请手动处理：%s' % (rel, why, e))
+                why = '要筛掉但挪不动：' + why
+                pending_rows.append([now, rel, '出错', why, '', ''])
+                result['result'] = '出错'
+        result['items'] = [{'reason': why, 'hit': '', 'at': ''}]
+        done.add(rel)
+        emit_ev('RESULT', json.dumps(result, ensure_ascii=False))
+        return True
+
     while not stop.is_set():
         todo = [v for v in list_videos(folder, opts['recursive']) if v not in done]
+        # 先和筛选记忆对一遍，之前查过的不用排队。还在下载的先不管，下完了下面检查前会再对一次
+        hits = 0
+        for rel in todo:
+            if stop.is_set():
+                break
+            path = os.path.join(folder, rel)
+            if settled(path):
+                fp = fingerprint_or_none(path)
+                if fp and from_memory(rel, fp):
+                    hits += 1
+        if hits:
+            log('%d 个视频之前查过，按筛选记忆处理，没有再查。' % hits)
+            if write_report(folder, pending_rows, log):
+                pending_rows = []
+            todo = [v for v in todo if v not in done]
         if not todo:
             if not opts['watch']:
                 break
@@ -608,6 +811,11 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
                     done.add(rel)
                 continue  # 还在下载，下一轮再查
             tries[rel] = 0
+            fp = fingerprint_or_none(path)
+            if fp and from_memory(rel, fp):
+                if write_report(folder, pending_rows, log):
+                    pending_rows = []
+                continue
             log('检查：%s' % rel)
             emit_ev('FILE', rel)
             t0 = time.time()
@@ -647,11 +855,15 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
                     log('　　筛掉：%s「%s」，在 %s' % (reason, hit, fmt_t(sec)))
                     pending_rows.append([now, rel, '筛掉', reason, hit, fmt_t(sec)])
                     result['items'].append({'reason': reason, 'hit': hit, 'at': fmt_t(sec)})
+                if fp:
+                    memory.add(fp, '筛掉', result['moved'], checks, '、'.join(found))
             else:
                 kept += 1
                 log('　　保留（用时 %d 秒）' % (time.time() - t0))
                 pending_rows.append([now, rel, '保留', '', '', ''])
                 result['result'] = '保留'
+                if fp:
+                    memory.add(fp, '保留', path, checks)
             done.add(rel)
             if write_report(folder, pending_rows, log):
                 pending_rows = []
@@ -667,7 +879,8 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
 
     if pending_rows:
         write_report(folder, pending_rows, log)
-    log('结束：本轮保留 %d 个，筛掉 %d 个。筛掉的在「%s」文件夹里。' % (kept, rejected, REJECT_DIR))
+    skipped = '，之前查过的 %d 个没再查' % remembered if remembered else ''
+    log('结束：本轮保留 %d 个，筛掉 %d 个%s。筛掉的在「%s」文件夹里。' % (kept, rejected, skipped, REJECT_DIR))
 
 
 # ---------------------------------------------------------------- 识别进程
