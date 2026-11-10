@@ -25,7 +25,9 @@ os.environ.setdefault('HF_HUB_DISABLE_XET', '1')
 
 import re
 import csv
+import io
 import json
+import math
 import time
 import queue
 import hashlib
@@ -180,21 +182,228 @@ def fmt_t(sec):
 
 
 # ---------------------------------------------------------------- 识别引擎
-def cpu_plan():
+def cpu_plan(frame_on=True):
     """怎么分 CPU：(文字识别开几份, 每份几个线程, 语音识别几个线程)
     识别组件默认把所有核都用上，在现在常见的大小核 CPU 上线程之间互相等，反而慢一倍多。
-    实测每份 4 个线程最快；核多的电脑就多开几份，同时认不同的帧。"""
+    实测每份 4 个线程最快；核多的电脑就多开几份，同时认不同的帧。
+    5~8 线程的电脑开两份、每份少几个线程更快（实测快一成半）；这时画面和语音一起查，
+    语音少分两个线程（它比画面快得多，不拖后腿），只查语音时还是给足线程。"""
     n = os.cpu_count() or 4
-    workers = 1 if n <= 8 else (2 if n <= 12 else 3)
-    threads = 2 if n <= 4 else 4
+    if n <= 4:
+        workers, threads, asr = 1, 2, 2
+    elif n <= 8:
+        workers, threads = 2, (3 if n >= 8 else 2)
+        asr = 2 if frame_on else 4
+    else:
+        workers, threads, asr = (2 if n <= 12 else 3), 4, 4
     env = os.environ.get  # 开发时用来对比不同分法
     return (int(env('SUCAI_OCR_WORKERS') or workers), int(env('SUCAI_OCR_THREADS') or threads),
-            int(env('SUCAI_ASR_THREADS') or threads))
+            int(env('SUCAI_ASR_THREADS') or asr))
+
+
+def _ort_no_spin():
+    """文字识别的线程干完一步，默认原地空转等下一步。几份文字识别和语音识别一起跑时，空转的线程
+    白白占着 CPU，干活的线程反而慢。改成闲下来就休息：认出来的字完全一样，只是更快。"""
+    if os.environ.get('SUCAI_OCR_SPIN') == '1':  # 开发时对比用
+        return False
+    try:
+        from rapidocr_onnxruntime.utils import infer_engine
+        cls = infer_engine.OrtInferSession
+        orig = cls._init_sess_opts
+    except Exception:
+        return False
+    if getattr(orig, 'no_spin', False):
+        return True
+
+    def init_sess_opts(config):
+        so = orig(config)
+        try:
+            so.add_session_config_entry('session.intra_op.allow_spinning', '0')
+        except Exception:
+            pass
+        return so
+    init_sess_opts.no_spin = True
+    cls._init_sess_opts = staticmethod(init_sess_opts)
+    return True
+
+
+class _LutPreProcess:
+    """文字检测前的像素换算（÷255、减 0.5、再 ÷0.5）。原来每帧要做好几遍整幅图的浮点运算，
+    这里把 256 种像素值事先算好放进表里，查一次表就完成。表是用原来的算法算的，结果一模一样。"""
+
+    def __init__(self, pre, lut):
+        self.pre = pre
+        self.lut = lut
+
+    def __call__(self, img):
+        if getattr(img, 'dtype', None) != 'uint8' or img.ndim != 3 or img.shape[2] != 3:
+            return self.pre(img)
+        import cv2
+        import numpy as np
+        img = self.pre.resize(img)
+        if img is None:
+            return None
+        return np.ascontiguousarray(cv2.LUT(img, self.lut).transpose(2, 0, 1))[None]
+
+
+def _lut_det_pre(rapid):
+    """给一份文字识别换上查表的像素换算。先拿一张图核对，和原来的结果有一点不同就不换"""
+    try:
+        import numpy as np
+        det = rapid.text_det
+        orig_get = det.get_preprocess
+        pre = orig_get(1280)
+        probe = np.repeat(np.arange(256, dtype=np.uint8).reshape(1, 256, 1), 3, axis=2)
+        lut = np.ascontiguousarray(pre.normalize(probe).astype(np.float32))
+        test = np.random.default_rng(7).integers(0, 256, size=(72, 120, 3), dtype=np.uint8)
+        want, got = pre(test), _LutPreProcess(pre, lut)(test)
+        if want is None or got is None or want.shape != got.shape or not np.array_equal(want, got):
+            return False
+    except Exception:
+        return False
+
+    def get_preprocess(max_wh):
+        return _LutPreProcess(orig_get(max_wh), lut)
+    det.get_preprocess = get_preprocess
+    return True
+
+
+class TextReuse:
+    """一个视频里认过的字块（每个视频一份，几份文字识别共用）。
+    新的一帧里检测到的字块，如果前几秒在同一个位置认过，而且这一块连同四周一圈的画面几乎没变
+    （标题、贴纸、水印、还没换的字幕），就直接用上次认出来的字，不再认一遍。
+    位置挪了、旁边多出字、画面有一点变化（越淡的字要求越严），都照常认；同一块字最多沿用 4 秒，
+    到时候重新认一遍。"""
+    MAX_AGE = 4.0   # 秒，和「画面几乎一样的帧 4 秒内跳过」一致
+    PAD = 0.3       # 比对时字块四周多带上的一圈，按字高算
+    SIG_H = 24      # 比对用的缩小图高度
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.items = []   # (秒, 画面尺寸, 字块范围, 比对范围, 缩小图, 门槛, 认出来的结果)
+        self.reused = 0
+        self.fresh = 0
+
+    @staticmethod
+    def _rect(box):
+        xs = [float(p[0]) for p in box]
+        ys = [float(p[1]) for p in box]
+        return min(xs), min(ys), max(xs), max(ys)
+
+    @staticmethod
+    def _near(a, b):
+        tol = max(2.0, 0.25 * (a[3] - a[1]))
+        return all(abs(a[k] - b[k]) <= tol for k in range(4))
+
+    def _region(self, r, shape):
+        p = self.PAD * max(1.0, r[3] - r[1])
+        return (max(0, int(r[0] - p)), max(0, int(r[1] - p)),
+                min(shape[1], int(math.ceil(r[2] + p))), min(shape[0], int(math.ceil(r[3] + p))))
+
+    def _sig(self, img, reg):
+        import cv2
+        g = cv2.cvtColor(img[reg[1]:reg[3], reg[0]:reg[2]], cv2.COLOR_BGR2GRAY)
+        w = max(1, int(round(g.shape[1] * self.SIG_H / float(g.shape[0]))))
+        return cv2.resize(g, (w, self.SIG_H), interpolation=cv2.INTER_AREA).astype('int16')
+
+    def _worst(self, a, b):
+        """两张缩小图按半个字宽分块比，返回差得最多的那一块的平均差（0~255）"""
+        cols = abs(a - b).mean(axis=0)
+        step = self.SIG_H // 2
+        return max(float(cols[k:k + step].mean()) for k in range(0, len(cols), step))
+
+    def lookup(self, img, t, boxes):
+        """返回 (每个字块沿用的结果，没有的是 None, 要重新认的字块序号)"""
+        with self.lock:
+            items = [e for e in self.items if abs(t - e[0]) <= self.MAX_AGE and e[1] == img.shape]
+        out, todo = [None] * len(boxes), []
+        for i, box in enumerate(boxes):
+            r = self._rect(box)
+            best = None
+            for e in items:
+                if not self._near(r, e[2]):
+                    continue
+                cur = self._sig(img, e[3])
+                if cur.shape != e[4].shape:
+                    continue
+                worst = self._worst(cur, e[4])
+                if worst <= e[5] and (best is None or worst < best[0]):
+                    best = (worst, e[6])
+            if best is None:
+                todo.append(i)
+            else:
+                out[i] = best[1]
+        with self.lock:
+            self.reused += len(boxes) - len(todo)
+        return out, todo
+
+    def store(self, img, t, boxes, results):
+        new = []
+        for box, res in zip(boxes, results):
+            r = self._rect(box)
+            reg = self._region(r, img.shape)
+            if reg[2] - reg[0] < 2 or reg[3] - reg[1] < 2:
+                continue
+            sig = self._sig(img, reg)
+            # 字越淡，画面差一点就可能是换了字，要求越严
+            limit = min(8.0, max(2.5, 0.15 * float(sig.std())))
+            new.append((t, img.shape, r, reg, sig, limit, res))
+        with self.lock:
+            self.fresh += len(boxes)
+            keep = [e for e in self.items if abs(t - e[0]) <= self.MAX_AGE + 2]
+            for n in new:  # 同一个位置只留最新认的那次
+                keep = [e for e in keep if not (e[0] <= n[0] and self._near(n[2], e[2]))]
+            self.items = keep + new
+
+
+class _ReuseHook:
+    """接在一份文字识别里：检测完字块、认字之前，先看看哪些字块能沿用 TextReuse 里认过的结果"""
+
+    def __init__(self, rapid):
+        self.det, self.rec = rapid.auto_text_det, rapid.text_rec
+        self.job = None   # (TextReuse, 秒)；None = 这次照常认
+        self.img = self.boxes = None
+        rapid.auto_text_det = self._det
+        rapid.text_rec = self._rec
+
+    @classmethod
+    def attach(cls, rapid):
+        if not (callable(getattr(rapid, 'auto_text_det', None)) and callable(getattr(rapid, 'text_rec', None))):
+            return None
+        return cls(rapid)
+
+    def _det(self, img):
+        boxes, el = self.det(img)
+        self.img, self.boxes = (img, boxes) if self.job is not None else (None, None)
+        return boxes, el
+
+    def _rec(self, crops, *args, **kw):
+        job, img, boxes = self.job, self.img, self.boxes
+        self.img = self.boxes = None
+        if (job is None or img is None or boxes is None or any(args) or any(kw.values())
+                or not isinstance(crops, list) or len(crops) != len(boxes)):
+            return self.rec(crops, *args, **kw)
+        reuse, t = job
+        try:
+            out, todo = reuse.lookup(img, t, boxes)
+        except Exception:
+            return self.rec(crops, *args, **kw)
+        if not todo:
+            return out, 0.0
+        res, el = self.rec([crops[i] for i in todo], *args, **kw)
+        for i, r in zip(todo, res):
+            out[i] = r
+        try:
+            reuse.store(img, t, [boxes[i] for i in todo], res)
+        except Exception:
+            pass
+        return out, el
 
 
 class OcrEngine:
     def __init__(self, threads=4):
         import onnxruntime  # noqa: F401  必须比 cv2 先加载，否则在部分电脑上会直接崩溃
+        _ort_no_spin()
         try:
             from rapidocr_onnxruntime import RapidOCR
         except ImportError:
@@ -203,15 +412,28 @@ class OcrEngine:
             self.engine = RapidOCR(intra_op_num_threads=threads)
         except TypeError:
             self.engine = RapidOCR()
+        _lut_det_pre(self.engine)
+        try:
+            self.hook = _ReuseHook.attach(self.engine)
+        except Exception:
+            self.hook = None
         # 视频里的字基本都是正着的，不用先判断文字方向，每帧能省不少时间
         self.kw = {'use_cls': False}
 
-    def __call__(self, img, min_score):
+    def __call__(self, img, min_score, reuse=None, t=0.0):
+        """reuse：这个视频的 TextReuse（没有就每块字都重新认）；t：这一帧在第几秒"""
+        hook = self.hook
+        if hook is not None:
+            hook.job = (reuse, t) if reuse is not None else None
         try:
-            out = self.engine(img, **self.kw)
-        except TypeError:  # 老版本不认这个参数
-            self.kw = {}
-            out = self.engine(img)
+            try:
+                out = self.engine(img, **self.kw)
+            except TypeError:  # 老版本不认这个参数
+                self.kw = {}
+                out = self.engine(img)
+        finally:
+            if hook is not None:
+                hook.job = None
         res = out[0] if isinstance(out, tuple) else out
         if res is None:
             return []
@@ -312,14 +534,15 @@ class StageProgress:
 
 
 class Halt:
-    """该停下了：用户点了停止，或者「找到就停」时另一边已经找到问题"""
+    """该停下了：用户点了停止，或者「找到就停」时另一边已经找到问题，或者画面那边出错了"""
 
     def __init__(self, stop):
         self.stop = stop
         self.found = threading.Event()
+        self.abort = threading.Event()
 
     def is_set(self):
-        return self.stop.is_set() or self.found.is_set()
+        return self.stop.is_set() or self.found.is_set() or self.abort.is_set()
 
 
 def video_duration(box, vs):
@@ -368,6 +591,7 @@ def check_frames(path, cfg, pool, halt, prog):
     done = threading.Event()  # 画面这边已经不用再看了
     errors = []
     jobs = queue.Queue(maxsize=len(pool.engines) * 2)
+    reuse = None if os.environ.get('SUCAI_NO_REUSE') == '1' else TextReuse()
 
     def work(ocr):
         while True:
@@ -378,7 +602,7 @@ def check_frames(path, cfg, pool, halt, prog):
                 continue
             t, img = job
             try:
-                lines = ocr(img, cfg.min_score)
+                lines = ocr(img, cfg.min_score, reuse, t)
             except Exception as e:
                 errors.append(e)
                 continue
@@ -470,6 +694,9 @@ def check_video(path, cfg, pool, asr, stop, log, prog):
         th.start()
     try:
         frames = check_frames(path, cfg, pool, halt, stages.frames) if pool is not None else {}
+    except Exception:
+        halt.abort.set()  # 画面读不了，这个视频反正要记成出错，语音不用再听完
+        raise
     finally:
         if th is not None:
             th.join()
@@ -512,6 +739,36 @@ def is_stable(path):
         return False
 
 
+def read_text(path):
+    """读文字文件：UTF-8（可能带 BOM），或者被 Excel、记事本另存成的 ANSI（GBK）。
+    一行一行判断，所以 Excel 存成 GBK 以后旧版本又接着写进 UTF-8 的记录，也都能读对"""
+    with open(path, 'rb') as f:
+        data = f.read()
+    try:
+        text = data.decode('utf-8')
+    except UnicodeDecodeError:
+        parts = []
+        for line in data.splitlines(True):  # 换行符不会出现在 GBK 汉字的字节里，按行切开是安全的
+            try:
+                parts.append(line.decode('utf-8'))
+            except UnicodeDecodeError:
+                parts.append(line.decode('gbk', errors='replace'))
+        text = ''.join(parts)
+    return text[1:] if text.startswith('\ufeff') else text
+
+
+def file_encoding(path):
+    """接着往文件里写用的编码：被 Excel 另存成 ANSI（GBK）的接着用 GBK，Excel 里看着才不乱码；其他用 UTF-8"""
+    try:
+        with open(path, 'rb') as f:
+            f.read().decode('utf-8')
+    except UnicodeDecodeError:
+        return 'gbk'
+    except OSError:
+        pass
+    return 'utf-8'
+
+
 def load_done(folder):
     """记录里有的视频都算查过了；最后一条是「重查」（在软件里点了重新检查）的除外。
     返回 {相对路径: (结果, 检查时间)}，都是这个视频最近的一条"""
@@ -520,13 +777,12 @@ def load_done(folder):
     if not os.path.exists(p):
         return done
     try:
-        with open(p, encoding='utf-8-sig', newline='') as f:
-            for row in csv.DictReader(f):
-                res, rel = row.get('结果'), row.get('文件', '')
-                if res in ('保留', '筛掉', '出错', '放回'):
-                    done[rel] = (res, row.get('检查时间') or '')
-                elif res == '重查':
-                    done.pop(rel, None)
+        for row in csv.DictReader(io.StringIO(read_text(p), newline='')):
+            res, rel = row.get('结果'), row.get('文件') or ''
+            if res in ('保留', '筛掉', '出错', '放回'):
+                done[rel] = (res, row.get('检查时间') or '')
+            elif res == '重查':
+                done.pop(rel, None)
     except Exception:
         pass
     return done
@@ -535,8 +791,9 @@ def load_done(folder):
 def write_report(folder, rows, log):
     p = os.path.join(folder, REPORT_NAME)
     new = not os.path.exists(p)
+    enc = 'utf-8-sig' if new else file_encoding(p)
     try:
-        with open(p, 'a', encoding='utf-8-sig' if new else 'utf-8', newline='') as f:
+        with open(p, 'a', encoding=enc, errors='replace', newline='') as f:
             w = csv.writer(f)
             if new:
                 w.writerow(REPORT_HEAD)
@@ -544,6 +801,9 @@ def write_report(folder, rows, log):
         return True
     except PermissionError:
         log('　　「%s」被 Excel 打开着，写不进记录。关掉它，下一个视频会一起补上。' % REPORT_NAME)
+        return False
+    except OSError as e:  # 网络盘暂时断开之类：先留着，下一个视频一起补上
+        log('　　「%s」暂时写不进去（%s），下一个视频会一起补上。' % (REPORT_NAME, str(e)[:60]))
         return False
 
 
@@ -675,7 +935,7 @@ def memory_action(entry, opts):
     opts['frame'] / opts['audio']  这次勾没勾「画面」「语音」
     窗口里「待检查」的个数是按「保留、放回 → skip，其他 → check」算的（Memory.cs 的 Skips），
     这里改了规则，那边也要跟着改，不然个数会对不上。"""
-    # TODO(human): 按你的用法决定之前查过的视频怎么处理（现在：通过的不再查，筛掉过的重新查）
+    # 通过的（保留、手动放回）不再查；筛掉过的又出现了（多半是手动从「已筛掉」拖出来的），重新查一遍
     if entry['result'] in ('保留', '放回'):
         return 'skip'
     return 'check'
@@ -703,7 +963,7 @@ def backfill(folder, records, memory):
 def run_folder(folder, opts, engines, stop, log, emit_ev):
     """opts: frame/audio/watch/recursive；engines: dict 放 ocr/asr（懒加载，重复使用）"""
     cfg = Config()
-    workers, threads, asr_threads = cpu_plan()
+    workers, threads, asr_threads = cpu_plan(opts['frame'])
     if opts['frame'] and engines.get('ocr') is None:
         log('正在加载文字识别……')
         engines['ocr'] = OcrPool(workers, threads)
@@ -726,8 +986,9 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
     checks = '+'.join(name for name, on in (('画面', opts['frame']), ('语音', opts['audio'])) if on)
     pending_rows = []
     kept = rejected = remembered = 0
-    tries = {}
+    waiting = {}   # 还没下载完的视频 -> (第一次看到它没下完的时间, 当时的大小, 大小最后一次变化的时间)
     announced_wait = False
+    folder_lost = False
     last_todo = -1
 
     def from_memory(rel, fp):
@@ -767,8 +1028,36 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
         emit_ev('RESULT', json.dumps(result, ensure_ascii=False))
         return True
 
+    def still_waiting(rel, path):
+        """还没下载完的视频要不要接着等。一直是空文件超过 1 分钟、或者等了半小时还没下完的，不再等"""
+        now = time.time()
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = -1
+        first, last_size, changed = waiting.get(rel, (now, size, now))
+        if size != last_size:
+            changed = now
+        waiting[rel] = (first, size, changed)
+        if size <= 0 and now - changed > 60:
+            return False
+        return now - first < 1800
+
     while not stop.is_set():
-        todo = [v for v in list_videos(folder, opts['recursive']) if v not in done]
+        try:
+            todo = [v for v in list_videos(folder, opts['recursive']) if v not in done]
+        except OSError as e:
+            # 网络盘、移动硬盘暂时断开：自动检查模式下等它恢复，不直接停掉
+            if not opts['watch']:
+                raise
+            if not folder_lost:
+                log('视频文件夹暂时打不开（%s），等它恢复后接着查……' % str(e)[:60])
+                folder_lost = True
+            stop.wait(5)
+            continue
+        if folder_lost:
+            log('视频文件夹又能打开了，接着查。')
+            folder_lost = False
         # 先和筛选记忆对一遍，之前查过的不用排队。还在下载的先不管，下完了下面检查前会再对一次
         hits = 0
         for rel in todo:
@@ -800,17 +1089,18 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
         announced_wait = False
         emit_ev('QUEUE', json.dumps({'todo': len(todo)}))
 
+        handled = 0
         for rel in todo:
             if stop.is_set():
                 break
             path = os.path.join(folder, rel)
             if not is_stable(path):
-                tries[rel] = tries.get(rel, 0) + 1
-                if tries[rel] > 40:  # 一直在变或是空文件，不再等
-                    log('跳过（文件一直在变化或是空的）：%s' % rel)
+                if not still_waiting(rel, path):
+                    log('跳过（文件一直是空的，或者一直在变化）：%s' % rel)
                     done.add(rel)
                 continue  # 还在下载，下一轮再查
-            tries[rel] = 0
+            waiting.pop(rel, None)
+            handled += 1
             fp = fingerprint_or_none(path)
             if fp and from_memory(rel, fp):
                 if write_report(folder, pending_rows, log):
@@ -876,6 +1166,8 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
             if not left:
                 break
             stop.wait(2)
+        elif not handled:
+            stop.wait(2)  # 这一轮的视频都还在下载，歇一下再看，不空转
 
     if pending_rows:
         write_report(folder, pending_rows, log)
