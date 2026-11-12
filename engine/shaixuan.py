@@ -8,8 +8,10 @@
     python shaixuan.py --worker -      任务参数放在环境变量 SUCAI_JOB 里（JSON）
 识别进程把进度一行一行写到标准输出，每行是「类型<Tab>内容」：
     LOG 文字 / QUEUE {"todo":n} / FILE 相对路径 / PROG {"stage":"画面","pct":37}
-    RESULT {...} / DONE 相对路径 / IDLE / FAIL 原因
-RESULT 里带 "memo": true 的，是按「筛选记忆」处理的（之前查过，这次没有真的查）。
+    RESULT {...} / DONE 相对路径 / IDLE {"stop_in":秒,"downloading":n} / FAIL 原因
+RESULT 里带 "memo": true 的，是按「筛选记忆」处理的（历史通过，这次没有真的查）。
+IDLE：都查完了，在等新视频。stop_in 是再过几秒没有动静就自动停止（-1 = 不自动停止），
+downloading 是文件夹里正在下载的文件个数。
 """
 import os
 import sys
@@ -48,6 +50,9 @@ LOG_PATH = os.path.join(DATA_DIR, '运行日志.txt')
 MEMORY_PATH = os.path.join(DATA_DIR, '筛选记忆.txt')
 MODEL_DIR = os.path.join(HOME_DIR, 'models')
 VIDEO_EXT = ('.mp4', '.mov', '.webm', '.m4v', '.mkv', '.flv')
+# 浏览器、下载软件边下边写的临时文件：这些文件在变大，说明还在下载，先不自动停止
+DOWNLOAD_EXT = ('.crdownload', '.part', '.partial', '.download', '.downloading', '.tmp', '.xltd', '.td',
+                '.aria2', '.!ut', '.!qb', '.opdownload', '.bc!')
 REJECT_DIR = '已筛掉'
 REPORT_NAME = '筛选记录.csv'
 REPORT_HEAD = ['检查时间', '文件', '结果', '原因', '命中内容', '出现位置']
@@ -67,7 +72,7 @@ DEFAULT_INI = """; 素材筛选器设置。一般在软件里点「筛选规则�
 
 [价格]
 ; 画面字幕和语音里出现这些词，就算说了价格
-; 「¥19.9」「9.9元」「九块九」「十九块钱」这类说法程序会自动识别，不用写在这里
+; 「¥19.9」「9.9元」「九块九」「十九块钱」「只要39.9」这类说法程序会自动识别，不用写在这里
 价格关键词 = 价格,价钱,到手价,券后,原价,现价,售价,特价,秒杀价,活动价,优惠价,多少钱,几块钱
 
 [语音]
@@ -80,6 +85,9 @@ DEFAULT_INI = """; 素材筛选器设置。一般在软件里点「筛选规则�
 [其他]
 ; 找到一个问题就不再往下查（快很多）：是 / 否
 找到就停 = 是
+; 勾了「自动检查新下载的视频」和「查完自动停止」时：查完以后等几分钟，
+; 这段时间里没有新视频、也没有正在下载的，就自动停止
+查完等几分钟 = 2
 """
 
 
@@ -126,11 +134,14 @@ class Config:
         self.model = (cp.get('语音', '模型') or 'small').strip()
         self.audio_douyin = _yes(cp.get('语音', '也查抖音关键词'))
         self.stop_early = _yes(cp.get('其他', '找到就停'))
+        self.idle_minutes = min(240.0, max(0.0, _num(cp.get('其他', '查完等几分钟'), 2.0)))
 
 
 # ---------------------------------------------------------------- 文字判断
 # 繁体常见字转简体（语音识别偶尔会出繁体）
-T2S = str.maketrans('價塊錢圓現優殺動幾號後億萬兩', '价块钱圆现优杀动几号后亿万两')
+_T2S_PAIRS = ('價价 塊块 錢钱 圓圆 現现 優优 殺杀 動动 幾几 號号 後后 億亿 萬万 兩两 點点 減减 僅仅 隻只 購购 買买 '
+              '賣卖 單单 郵邮 費费 貨货 個个 這这 來来 為为 門门 條条 雙双 贈赠 實实 寶宝 車车 黃黄 搶抢 劵券')
+T2S = str.maketrans(''.join(p[0] for p in _T2S_PAIRS.split()), ''.join(p[1] for p in _T2S_PAIRS.split()))
 
 
 def norm(t):
@@ -139,41 +150,93 @@ def norm(t):
 
 
 _C = '[零一二两三四五六七八九十百千万]'
-_NOT_PRICE = '(?![旦素宵件头状])'  # 元旦、元素、一块头……不是价格
+_NOT_PRICE = '(?![旦素宵件头状]|复始)'  # 元旦、元素、一块头、一元复始……不是价格
+_ABOUT = '[多来余几]?'                  # 一百多块、二十来块、十几块
+# 「只要39.9」「到手39.9」：这些词后面跟着数，没写「元」也是价格。
+# 数后面紧跟着天、件、%、折这类的不算（到手3天、直降50%、拍下2件、秒杀1000单）
+_TRIGGER = ('(?:只要|只需|仅需|仅要|仅售|只卖|才卖|才要|低至|直降|立减|到手|秒杀|拍下|折后|'
+            '一口价|惊爆价|福利价|包邮价|特惠价|团购价|直播价)')
+_NOT_AMOUNT = ('(?![\\d.]|%s|\\s?(?:%%|折|倍|天|日|号|周|月|年|小时|分钟|分|秒|次|单|件|个|只|条|包|盒|瓶|袋|片|张|'
+               '双|对|套|支|根|斤|克|千克|公斤|吨|米|厘米|毫米|升|毫升|cm|mm|ml|kg|g|岁|人|台|款|种|层|位|寸|度|期|集|'
+               '颗|粒|步|下|遍|份|箱|口|节|元|块|毛|角))' % _C)
 PRICE_PATTERNS = [re.compile(p) for p in [
-    r'¥\s?\d',                                        # ¥19.9
-    r'\d+(?:\.\d+)?\s?(?:元|圆)' + _NOT_PRICE,         # 9.9元
-    r'\d+(?:\.\d+)?\s?块钱',                           # 19块钱
-    r'\d+\.\d+\s?块',                                  # 9.9块
-    r'\d{2,}\s?块' + _NOT_PRICE,                       # 19块
-    r'(?:\d|%s)\s?块\s?(?:\d|%s)(?!\s?块)' % (_C, _C),  # 九块九、19块9（排除「一块一块」）
-    r'%s{2,}\s?(?:元|块钱|块)' % _C + _NOT_PRICE,      # 十九块、二十元
-    r'%s\s?(?:元|块钱)' % _C + _NOT_PRICE,             # 九块钱、五元
+    r'¥\s?\d',                                                    # ¥19.9
+    r'\d+(?:\.\d+)?\s?%s\s?(?:元|圆)' % _ABOUT + _NOT_PRICE,       # 9.9元、100多元
+    r'\d+(?:\.\d+)?\s?%s\s?块钱' % _ABOUT,                         # 19块钱、100多块钱
+    r'\d+\.\d+\s?块',                                              # 9.9块
+    r'\d{2,}\s?%s\s?块' % _ABOUT + _NOT_PRICE,                     # 19块、100多块
+    r'(?:\d|%s)\s?块\s?(?:\d|%s)(?!\s?块)' % (_C, _C),              # 九块九、19块9（排除「一块一块」）
+    r'%s{2,}\s?%s\s?(?:元|块钱|块)' % (_C, _ABOUT) + _NOT_PRICE,    # 十九块、二十元、一百多块钱
+    r'%s\s?%s\s?(?:元|块钱)' % (_C, _ABOUT) + _NOT_PRICE,           # 九块钱、五元、十几块钱
+    r'%s+点%s+\s?(?:元|块钱|块)' % (_C, _C),                        # 三十九点九元
+    r'(?:\d|%s)\s?毛\s?(?:钱|\d|%s)' % (_C, _C),                     # 九毛九、五毛钱
+    r'\d+\.\d{1,2}\s?/\s?(?:件|个|盒|包|瓶|袋|只|条|斤|箱|套|双|支|份|kg|g)',   # 9.9/件
+    _TRIGGER + r'\s?¥?\s?(?:\d+(?:\.\d+)?|%s{2,}(?:点%s+)?)' % (_C, _C) + _NOT_AMOUNT,  # 只要39.9、低至十九
 ]]
-AT_PATTERN = re.compile(r'@[\w\u4e00-\u9fff]{2,}')
+# @用户名；前面紧挨着字母数字的是邮箱（kefu@qq.com），不算
+AT_PATTERN = re.compile(r'(?<![A-Za-z0-9._%+\-])@[\w一-鿿]{2,}')
+# 「抖」字没认出来也算：「?音号：dy123456」
+DOUYIN_PATTERNS = [re.compile(r'音号:?[A-Za-z0-9_.\-]{5,}')]
+# 语音识别常把「块」听成「快」（九快九、十九快钱）
+_SPEECH_FIX = re.compile(r'(?<=[\d零一二两三四五六七八九十百千万])快')
 
 
-def find_douyin(text, cfg):
-    low = text.lower()
-    for w in cfg.douyin_words:
-        if w and w in low:
-            return w
-    if cfg.check_at:
-        m = AT_PATTERN.search(text)
-        if m:
-            return m.group()
+def norm_speech(t):
+    return _SPEECH_FIX.sub('块', norm(t))
+
+
+def _sure(confs, a, b, need):
+    """命中的这几个字，文字识别认得有没有把握。confs 是每个字的把握；语音识别没有（None），不看"""
+    if confs is None:
+        return True
+    vals = [c for c in confs[a:b] if c is not None]
+    return not vals or sum(vals) / len(vals) >= need
+
+
+def _first(text, confs, need, words, patterns):
+    """第一个够把握的命中：先找关键词，再找写法"""
+    for w in words:
+        if not w:
+            continue
+        i = text.find(w)
+        while i >= 0:
+            if _sure(confs, i, i + len(w), need):
+                return w
+            i = text.find(w, i + 1)
+    for p in patterns:
+        for m in p.finditer(text):
+            if _sure(confs, m.start(), m.end(), need):
+                return m.group()
     return None
 
 
-def find_price(text, cfg):
-    for w in cfg.price_words:
-        if w and w in text:
-            return w
-    for p in PRICE_PATTERNS:
-        m = p.search(text)
-        if m:
-            return m.group()
-    return None
+def find_douyin(text, cfg, confs=None):
+    low = ''.join(c.lower()[0] for c in text)   # 一个字一个字转小写，长度不变，和每个字的把握对得上
+    hit = _first(low, confs, cfg.min_score, cfg.douyin_words, ())
+    if hit:
+        return hit
+    return _first(text, confs, cfg.min_score, (), DOUYIN_PATTERNS + ([AT_PATTERN] if cfg.check_at else []))
+
+
+def find_price(text, cfg, confs=None):
+    return _first(text, confs, cfg.min_score, cfg.price_words, PRICE_PATTERNS)
+
+
+def join_lines(lines):
+    """一帧里认出的几行字连成一串（行和行之间空一格），同时带上每个字的把握；
+    规整写法（norm）以后也一个字对一个把握。lines 是 [(文字, 整行把握, 每个字的把握或 None)]"""
+    chars, confs = [], []
+    for txt, score, cs in lines:
+        if chars:
+            chars.append(' ')
+            confs.append(None)
+        if cs is None or len(cs) != len(txt):
+            cs = [score] * len(txt)
+        for ch, c in zip(txt, cs):
+            for x in norm(ch):
+                chars.append(x)
+                confs.append(float(c))
+    return ''.join(chars), confs
 
 
 def fmt_t(sec):
@@ -201,10 +264,17 @@ def cpu_plan(frame_on=True):
             int(env('SUCAI_ASR_THREADS') or asr))
 
 
-def _ort_no_spin():
-    """文字识别的线程干完一步，默认原地空转等下一步。几份文字识别和语音识别一起跑时，空转的线程
-    白白占着 CPU，干活的线程反而慢。改成闲下来就休息：认出来的字完全一样，只是更快。"""
-    if os.environ.get('SUCAI_OCR_SPIN') == '1':  # 开发时对比用
+def _ort_tune():
+    """文字识别组件的两处设置，认出来的字和把握一模一样，只是更快：
+    1. 线程干完一步默认原地空转等下一步。几份文字识别和语音识别一起跑时，空转的线程白白占着 CPU，
+       干活的线程反而慢。改成闲下来就休息（v2.2）。
+    2. 认字那一步的内存池（v2.3）。识别组件默认关着它：每认一批字都向系统要一大块新内存、用完就还，
+       系统每次都要把新给的内存清零，一帧要清一个多 G，在内存带宽有限的笔记本上比认字本身还费时间。
+       打开以后同一块内存反复用，认字快四成；每份文字识别多占 70MB 左右。
+       找字那一步实测打开不见快、反而每份多占 500MB，所以不开。"""
+    spin = os.environ.get('SUCAI_OCR_SPIN') != '1'    # 开发时对比用
+    arena = os.environ.get('SUCAI_REC_ARENA') != '0'
+    if not (spin or arena):
         return False
     try:
         from rapidocr_onnxruntime.utils import infer_engine
@@ -212,19 +282,102 @@ def _ort_no_spin():
         orig = cls._init_sess_opts
     except Exception:
         return False
-    if getattr(orig, 'no_spin', False):
+    if getattr(orig, 'tuned', False):
         return True
 
     def init_sess_opts(config):
         so = orig(config)
+        if spin:
+            try:
+                so.add_session_config_entry('session.intra_op.allow_spinning', '0')
+            except Exception:
+                pass
         try:
-            so.add_session_config_entry('session.intra_op.allow_spinning', '0')
+            model = os.path.basename(str(config.get('model_path') or '')).lower()
+            if arena and '_rec' in model:
+                so.enable_cpu_mem_arena = True
         except Exception:
             pass
         return so
-    init_sess_opts.no_spin = True
+    init_sess_opts.tuned = True
     cls._init_sess_opts = staticmethod(init_sess_opts)
     return True
+
+
+def _char_confs(rapid):
+    """让文字识别把每个字各自的把握也带回来（v2.3）。原来只给一整行的平均把握：一行里有几个字认得含糊，
+    整行就不算数，里面清清楚楚的「抖音号」也跟着丢了；反过来一行大体清楚，含糊认出来的「1元」也会算数。
+    现在只看命中的那几个字认得有没有把握。先拿随机数据和原来的算法核对，有一点不一样就不改"""
+    try:
+        import numpy as np
+        dec = rapid.text_rec.postprocess_op
+        orig = dec.decode
+        chars = dec.character
+        ignored = list(dec.get_ignored_tokens())
+        if not all(len(c) == 1 for c in chars[1:]):
+            return False
+
+        def decode(text_index, text_prob=None, return_word_box=False, is_remove_duplicate=False):
+            if return_word_box or text_prob is None:
+                return orig(text_index, text_prob, return_word_box, is_remove_duplicate)
+            out = []
+            for b in range(len(text_index)):
+                idx = text_index[b]
+                sel = np.ones(len(idx), dtype=bool)
+                if is_remove_duplicate:
+                    sel[1:] = idx[1:] != idx[:-1]
+                for tok in ignored:
+                    sel &= idx != tok
+                conf = np.array(text_prob[b][sel]).tolist()
+                text = ''.join(chars[i] for i in idx[sel])
+                out.append((text, np.mean(conf or [0]).tolist(), conf))
+            return out
+
+        rng = np.random.default_rng(5)
+        preds = rng.random((4, 40, len(chars))).astype(np.float32)
+        preds[:, ::3, 0] += 1.0   # 留一些空白，像真的一样
+        ti, tp = preds.argmax(axis=2), preds.max(axis=2)
+        want, got = orig(ti, tp, False, True), decode(ti, tp, False, True)
+        if [tuple(w) for w in want] != [g[:2] for g in got] or any(len(g[0]) != len(g[2]) for g in got):
+            return False
+    except Exception:
+        return False
+    dec.decode = decode
+    return True
+
+
+class _BucketRec:
+    """认字时按字块的长短分批（v2.3）。识别组件原来 6 块字一批来认，一批里每块都要补白补到最长那块的宽度：
+    短短的「包邮」「抖音」被补成一整行宽再认，白算不少，把握还被拉低（实测 0.77 → 1.00）。
+    现在长短差不多（最多差三成）的才放一批。认出来的字和原来一样，短字块的把握更准，认字快两成。"""
+    STEP = 1.3
+
+    def __init__(self, rec):
+        self.rec = rec
+        shape = getattr(rec, 'rec_image_shape', None) or [3, 48, 320]
+        self.base = float(shape[2]) / float(shape[1])
+        self.batch = max(1, int(getattr(rec, 'rec_batch_num', 6) or 6))
+
+    def __getattr__(self, name):
+        return getattr(self.rec, name)
+
+    def __call__(self, crops, *args, **kw):
+        if any(args) or any(kw.values()) or not isinstance(crops, list) or len(crops) < 2:
+            return self.rec(crops, *args, **kw)
+        ratio = [max(self.base, c.shape[1] / float(max(1, c.shape[0]))) for c in crops]
+        order = sorted(range(len(crops)), key=ratio.__getitem__)
+        out, spent, i = [None] * len(crops), 0.0, 0
+        while i < len(order):
+            j = i + 1
+            while j < len(order) and j - i < self.batch and ratio[order[j]] <= ratio[order[i]] * self.STEP:
+                j += 1
+            group = order[i:j]
+            res, el = self.rec([crops[k] for k in group])
+            for k, r in zip(group, res):
+                out[k] = r
+            spent += el or 0.0
+            i = j
+        return out, spent
 
 
 class _LutPreProcess:
@@ -400,10 +553,13 @@ class _ReuseHook:
         return out, el
 
 
+LINE_FLOOR = 0.5   # 整行平均把握低于这个的不看（识别组件原来自己就按 0.5 筛）
+
+
 class OcrEngine:
     def __init__(self, threads=4):
         import onnxruntime  # noqa: F401  必须比 cv2 先加载，否则在部分电脑上会直接崩溃
-        _ort_no_spin()
+        _ort_tune()
         try:
             from rapidocr_onnxruntime import RapidOCR
         except ImportError:
@@ -413,6 +569,11 @@ class OcrEngine:
         except TypeError:
             self.engine = RapidOCR()
         _lut_det_pre(self.engine)
+        self.char_confs = os.environ.get('SUCAI_LINE_SCORE') != '1' and _char_confs(self.engine)
+        if os.environ.get('SUCAI_NO_BUCKET') != '1' and callable(getattr(self.engine, 'text_rec', None)):
+            self.engine.text_rec = _BucketRec(self.engine.text_rec)
+        if self.char_confs and hasattr(self.engine, 'text_score'):
+            self.engine.text_score = 0.0   # 整行的门槛在下面自己判断
         try:
             self.hook = _ReuseHook.attach(self.engine)
         except Exception:
@@ -421,7 +582,9 @@ class OcrEngine:
         self.kw = {'use_cls': False}
 
     def __call__(self, img, min_score, reuse=None, t=0.0):
-        """reuse：这个视频的 TextReuse（没有就每块字都重新认）；t：这一帧在第几秒"""
+        """reuse：这个视频的 TextReuse（没有就每块字都重新认）；t：这一帧在第几秒。
+        返回 [(文字, 整行把握, 每个字的把握或 None)]。带了每个字的把握时，整行把握够 0.5 就留下，
+        够不够「可信度」由命中的那几个字决定（_sure）；没带的还是按整行把握筛"""
         hook = self.hook
         if hook is not None:
             hook.job = (reuse, t) if reuse is not None else None
@@ -437,15 +600,18 @@ class OcrEngine:
         res = out[0] if isinstance(out, tuple) else out
         if res is None:
             return []
+        floor = min(LINE_FLOOR, min_score) if self.char_confs else min_score
         if hasattr(res, 'txts'):  # 新版返回对象
             txts = list(res.txts or [])
             scores = list(res.scores or [1.0] * len(txts))
-            return [t for t, s in zip(txts, scores) if float(s) >= min_score]
+            return [(str(x), float(s), None) for x, s in zip(txts, scores) if float(s) >= min_score]
         lines = []
-        for item in res:  # 旧版返回 [框, 文字, 分数]
+        for item in res:  # 旧版返回 [框, 文字, 分数(, 每个字的把握)]
             try:
-                if float(item[2]) >= min_score:
-                    lines.append(str(item[1]))
+                s = float(item[2])
+                if s >= floor:
+                    cs = item[3] if self.char_confs and len(item) > 3 and isinstance(item[3], list) else None
+                    lines.append((str(item[1]), s, cs))
             except (IndexError, TypeError, ValueError):
                 continue
         return lines
@@ -485,18 +651,29 @@ def ensure_model(size, log):
                        % (size, str(last)[:200]))
 
 
+ASR_PROMPT = '以下是普通话的句子。'
+
+
 class AsrEngine:
     def __init__(self, size, log=print, threads=4):
         import onnxruntime  # noqa: F401  同上
         path = ensure_model(size, log)
         from faster_whisper import WhisperModel
         self.model = WhisperModel(path, device='cpu', compute_type='int8', cpu_threads=max(1, threads))
+        self.every_window = os.environ.get('SUCAI_ASR_FIRST_PROMPT') != '1'
 
     def transcribe(self, path):
-        # temperature 只给 0：听不清的段落不再换参数重听好几遍，省时间
-        return self.model.transcribe(
-            path, language='zh', vad_filter=True, beam_size=1, best_of=1, temperature=0.0,
-            condition_on_previous_text=False, initial_prompt='以下是普通话的句子。')
+        # temperature 只给 0：听不清的段落不再换参数重听好几遍，省时间。
+        # 「以下是普通话的句子」让它写简体字。语音识别每 30 秒听一段，原来这句提示只给第一段，
+        # 后面的段落常常写成繁体（「價錢」「長度」），现在每一段都给（v2.3）；第一段和原来完全一样
+        kw = dict(language='zh', vad_filter=True, beam_size=1, best_of=1, temperature=0.0,
+                  condition_on_previous_text=False)
+        if self.every_window:
+            try:
+                return self.model.transcribe(path, hotwords=ASR_PROMPT, **kw)
+            except TypeError:   # 老版本没有这个参数
+                self.every_window = False
+        return self.model.transcribe(path, initial_prompt=ASR_PROMPT, **kw)
 
 
 # ---------------------------------------------------------------- 检查一个视频
@@ -608,10 +785,10 @@ def check_frames(path, cfg, pool, halt, prog):
                 continue
             if not lines:
                 continue
-            text = ' '.join(norm(x) for x in lines)
+            text, confs = join_lines(lines)
             with lock:
                 for reason, finder in (('画面有抖音号', find_douyin), ('画面写了价格', find_price)):
-                    hit = finder(text, cfg)
+                    hit = finder(text, cfg, confs)
                     if hit and (reason not in found or t < found[reason][1]):
                         found[reason] = (hit, t)
                 if found and (cfg.stop_early or len(found) == 2):
@@ -659,7 +836,7 @@ def check_audio(path, cfg, asr, halt, prog):
         if total:
             prog('语音', seg.end * 100.0 / total)
         raw = (seg.text or '').strip()
-        text = norm(raw)
+        text = norm_speech(raw)
         if '语音说了价格' not in found:
             hit = find_price(text, cfg)
             if hit:
@@ -754,7 +931,7 @@ def read_text(path):
             except UnicodeDecodeError:
                 parts.append(line.decode('gbk', errors='replace'))
         text = ''.join(parts)
-    return text[1:] if text.startswith('\ufeff') else text
+    return text[1:] if text.startswith('﻿') else text
 
 
 def file_encoding(path):
@@ -925,7 +1102,7 @@ class Memory:
 
 def memory_action(entry, opts):
     """之前查过的视频又出现了（entry 是筛选记忆里它最近的一条），这次怎么处理。返回：
-        'skip'    不查，算通过（筛选记录里写「保留 · 之前查过」）
+        'skip'    不查，算通过（筛选记录里写「保留 · 历史通过」，旧版本写的是「之前查过」）
         'reject'  不查，直接挪进「已筛掉」，原因沿用上次的
         'check'   照常重新查一遍
     entry['result']  上次的结果：保留 / 筛掉 / 放回（放回 = 筛错了、手动放回来的）
@@ -939,6 +1116,32 @@ def memory_action(entry, opts):
     if entry['result'] in ('保留', '放回'):
         return 'skip'
     return 'check'
+
+
+def memo_note(entry, path):
+    """历史通过的视频，上次是什么时候、在哪儿查的：'2026-11-07 21:30 查过（在「密封毛条」）'"""
+    when = (entry.get('time') or '')[:16]
+    what = '手动放回过' if entry.get('result') == '放回' else '查过'
+    note = ('%s %s' % (when, what)).strip()
+    old = (entry.get('folder') or '').rstrip('\\/')
+    if old and os.path.normcase(old) != os.path.normcase(os.path.dirname(path).rstrip('\\/')):
+        note += '（在「%s」）' % (os.path.basename(old) or old)
+    return note
+
+
+def downloads_in(folder, recursive):
+    """文件夹里边下边写的临时文件（浏览器的 .crdownload 之类）-> 大小"""
+    out = {}
+    for root, dirs, files in os.walk(folder):
+        dirs[:] = [d for d in dirs if d != REJECT_DIR and not d.startswith('.')] if recursive else []
+        for f in files:
+            if f.lower().endswith(DOWNLOAD_EXT):
+                p = os.path.join(root, f)
+                try:
+                    out[os.path.relpath(p, folder)] = os.stat(p).st_size
+                except OSError:
+                    pass
+    return out
 
 
 def backfill(folder, records, memory):
@@ -990,6 +1193,12 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
     announced_wait = False
     folder_lost = False
     last_todo = -1
+    # 查完自动停止：查完以后文件夹 idle_secs 秒没有动静（没有新视频，也没有正在变大的下载文件）就结束
+    auto_stop = bool(opts.get('auto_stop'))
+    idle_secs = cfg.idle_minutes * 60.0
+    idle_since = None   # 从什么时候起没有动静
+    idle_seen = None    # 上次看到的文件夹样子：(视频, 下载中的临时文件和大小)
+    idle_shown = None   # 上次告诉窗口的等待状态，变了才再告诉
 
     def from_memory(rel, fp):
         """筛选记忆里有这个视频，就按 memory_action 处理。返回 True 表示处理完了，不用再查"""
@@ -1003,10 +1212,12 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
         path = os.path.join(folder, rel)
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         result = {'rel': rel, 'time': now, 'items': [], 'moved': '', 'memo': True}
+        note = ''
         if action == 'skip':
             remembered += 1
-            why = '之前查过'
-            pending_rows.append([now, rel, '保留', why, '', ''])
+            why = '历史通过'
+            note = memo_note(entry, path)
+            pending_rows.append([now, rel, '保留', why, note, ''])
             # 记下它现在的位置（结果、时间还是上次的），下次补记时不用再读文件
             memory.add(fp, entry['result'], path, entry['checks'], entry['reason'], entry['time'])
             result['result'] = '保留'
@@ -1023,7 +1234,7 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
                 why = '要筛掉但挪不动：' + why
                 pending_rows.append([now, rel, '出错', why, '', ''])
                 result['result'] = '出错'
-        result['items'] = [{'reason': why, 'hit': '', 'at': ''}]
+        result['items'] = [{'reason': why, 'hit': note, 'at': ''}]
         done.add(rel)
         emit_ev('RESULT', json.dumps(result, ensure_ascii=False))
         return True
@@ -1045,7 +1256,8 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
 
     while not stop.is_set():
         try:
-            todo = [v for v in list_videos(folder, opts['recursive']) if v not in done]
+            videos = list_videos(folder, opts['recursive'])
+            todo = [v for v in videos if v not in done]
         except OSError as e:
             # 网络盘、移动硬盘暂时断开：自动检查模式下等它恢复，不直接停掉
             if not opts['watch']:
@@ -1069,24 +1281,46 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
                 if fp and from_memory(rel, fp):
                     hits += 1
         if hits:
-            log('%d 个视频之前查过，按筛选记忆处理，没有再查。' % hits)
+            log('%d 个视频是历史通过的（以前查过没问题），跳过没有再查。' % hits)
             if write_report(folder, pending_rows, log):
                 pending_rows = []
             todo = [v for v in todo if v not in done]
         if not todo:
             if not opts['watch']:
                 break
+            now = time.time()
+            dl = downloads_in(folder, opts['recursive'])
+            seen = (frozenset(videos), dl)
+            # 正在下载：下载中的临时文件新出现了，或者比上次看到时变大了
+            growing = sum(1 for k, s in dl.items() if idle_seen is None or idle_seen[1].get(k) != s)
+            if idle_since is None or seen != idle_seen:
+                idle_since = now
+            idle_seen = seen
             if not announced_wait:
-                log('都查完了，正在等新视频……（点「停止」结束）')
-                emit_ev('IDLE', '')
+                if auto_stop:
+                    wait_text = '%s没有新视频就自动停止' % (
+                        ('%g 分钟' % cfg.idle_minutes) if idle_secs > 0 else '马上')
+                else:
+                    wait_text = '点「停止」结束'
+                log('都查完了，正在等新视频……（%s）' % wait_text)
                 announced_wait = True
                 last_todo = -1
-            stop.wait(3)
+            left = idle_secs - (now - idle_since)
+            if auto_stop and left <= 0 and not growing:
+                log('查完了，文件夹里也没有新视频，自动停止。')
+                break
+            state = ('下载', growing) if growing else ('等', idle_since if auto_stop else None)
+            if state != idle_shown:
+                idle_shown = state
+                emit_ev('IDLE', json.dumps({'stop_in': int(math.ceil(left)) if auto_stop else -1,
+                                            'downloading': growing}))
+            stop.wait(min(3.0, max(0.5, left)) if auto_stop else 3.0)
             continue
         if len(todo) != last_todo:
             log('有 %d 个视频要查。' % len(todo))
             last_todo = len(todo)
         announced_wait = False
+        idle_since = idle_seen = idle_shown = None
         emit_ev('QUEUE', json.dumps({'todo': len(todo)}))
 
         handled = 0
@@ -1171,7 +1405,7 @@ def run_folder(folder, opts, engines, stop, log, emit_ev):
 
     if pending_rows:
         write_report(folder, pending_rows, log)
-    skipped = '，之前查过的 %d 个没再查' % remembered if remembered else ''
+    skipped = '，历史通过的 %d 个跳过没查' % remembered if remembered else ''
     log('结束：本轮保留 %d 个，筛掉 %d 个%s。筛掉的在「%s」文件夹里。' % (kept, rejected, skipped, REJECT_DIR))
 
 
