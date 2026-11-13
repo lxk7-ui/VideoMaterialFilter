@@ -57,9 +57,14 @@ if (-not (Test-Path (Join-Path $model "model.bin"))) { Copy-Item -LiteralPath $M
 
 # Precompile everything. unchecked-hash .pyc files stay valid after zipping/unzipping (zip keeps
 # timestamps only to 2 s and in local time), so the first start does not recompile anything.
+# A .pyc records where its source file is. -s leaves the package folder out of that path, so the
+# files say "runtime\python\Lib\abc.py" and not the full path of the folder on the PC that built
+# the package (which would travel with every copy of it). -B keeps Python from writing .pyc files
+# of its own, with the full path, for the modules it imports while compiling (compileall would
+# then leave those alone), and -f recompiles whatever is already there.
 Get-ChildItem $rt -Recurse -Directory -Filter "__pycache__" | Remove-Item -Recurse -Force
 $env:PYTHONDONTWRITEBYTECODE = $null
-& (Join-Path $py "python.exe") -I -m compileall -q -j 0 --invalidation-mode unchecked-hash (Join-Path $py "Lib") (Join-Path $rt "app") | Out-Null
+& (Join-Path $py "python.exe") -I -B -m compileall -q -f -j 0 --invalidation-mode unchecked-hash -s $Pkg (Join-Path $py "Lib") (Join-Path $rt "app") | Out-Null
 if ($LASTEXITCODE -ne 0) { Write-Host "compileall reported problems (usually harmless test files)" }
 
 $mb = [math]::Round((Get-ChildItem $rt -Recurse -File | Measure-Object Length -Sum).Sum / 1MB, 1)
